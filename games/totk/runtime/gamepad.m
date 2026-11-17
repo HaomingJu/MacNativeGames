@@ -56,6 +56,7 @@ static int captureDown, captureSeen;   /* the capture button as the reports say,
 static _Atomic int screenshotButton = CONTROLLER_SCREENSHOT_DEFAULT;
 static ControllerHold screenshotHold;   /* gamepadLock */
 static void refresh_gamepads(void);
+static void hid_calibration_changed(void);
 static void gamepad_options_gesture(GCExtendedGamepad *pad);
 static void gamepad_gestures_changed(void);
 
@@ -111,13 +112,38 @@ static void load_controller_map(void) {
     runtime_prompt_controller(controllerMap);
 }
 
-static int32_t stick_axis(float value) {
-    const float deadzone = 0.12f;
-    float magnitude = fabsf(value);
-    if (magnitude <= deadzone) return 0;
-    if (magnitude > 1.0f) magnitude = 1.0f;
-    int32_t result = (int32_t)((magnitude - deadzone) / (1.0f - deadzone) * 32767.0f);
-    return value < 0 ? -result : result;
+/* The stick calibration (the settings panel's tool, controller-calibration.txt): center is where the stick rests when
+   released and scale stretches its real travel to full range. It applies before the deadzone so a drifting stick that has
+   been re-centred reads as centred, and a worn stick that no longer reaches the edge still reads full travel. */
+static RuntimeGamepadCalibration calibration = { .left = {0, 0, 1, 1}, .right = {0, 0, 1, 1} };
+/* The raw sticks before calibration (game coordinates, up positive): the calibration tool's live picture. A controller
+   other than GameController's own (the HID fallback) is folded in the same way as the game state. */
+static float gamepadRawLx, gamepadRawLy, gamepadRawRx, gamepadRawRy;
+
+static float gamepadRawLT, gamepadRawRT;   /* the analog triggers (0..1) for the calibration tool's bars */
+/* The HID fallback's raw sticks (game coordinates), kept by hid_pad_compute and folded into the gamepadRaw_* by
+   refresh_gamepads, so the calibration tool sees the same sticks the game does. */
+static float hidRawLx, hidRawLy, hidRawRx, hidRawRy;
+
+enum { STICK_LX = 0, STICK_LY, STICK_RX, STICK_RY };
+static float stick_calibrate(int axis, float value) {
+    const RuntimeStickCalibration *s = axis < STICK_RX ? &calibration.left : &calibration.right;
+    float center = (axis & 1) ? s->centerY : s->centerX;
+    float scale  = (axis & 1) ? s->scaleY  : s->scaleX;
+    float out = (value - center) * scale;
+    return out > 1.0f ? 1.0f : out < -1.0f ? -1.0f : out;
+}
+
+/* Radial response preserves direction and bounds diagonal travel to the unit circle.
+   Raw samples remain untouched for centre/range calibration and diagnostics. */
+#include "stick_response.h"
+static float stickDeadzone[2] = {0.12f, 0.12f};
+static int32_t stick_component(int axis, float x, float y) {
+    int base = axis & ~1;
+    x = stick_calibrate(base, x); y = stick_calibrate(base + 1, y);
+    if (!isfinite(x) || !isfinite(y)) return 0;
+    float gain = stick_response_gain(x, y, stickDeadzone[axis >= STICK_RX]);
+    return (int32_t)(((axis & 1) ? y : x) * gain * 32767.0f);
 }
 
 static int32_t stronger_axis(int32_t a, int32_t b) {
@@ -294,6 +320,99 @@ static void load_controller_type(void) {
 
 static void save_controller_type(int type) { setting_write("controller-type.txt", gamepad_type_name(type), "controller type"); }
 
+/* The stick calibration, one line of eight numbers: left centre X/Y and scale X/Y, then the right stick's, centre in
+   [-0.9, 0.9] (game coordinates) and scale in [1, 8]. A missing or bad file keeps the default (centre 0, scale 1). */
+static void load_calibration(void) {
+    char path[4096], word[512] = {0};
+    if (!setting_read("controller-calibration.txt", word, sizeof word, path, sizeof path)) return;
+    float v[8] = {0, 0, 1, 1, 0, 0, 1, 1};
+    if (sscanf(word, "%f %f %f %f %f %f %f %f", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7]) != 8) {
+        fprintf(stderr, "[totk-input] %s: not eight numbers; the stick calibration stays the default\n", path); return;
+    }
+    for (int s = 0; s < 2; s++) {
+        for (int a = 0; a < 2; a++) if (v[s * 4 + a] < -0.9f || v[s * 4 + a] > 0.9f) { fprintf(stderr, "[totk-input] %s: centre out of range\n", path); return; }
+        for (int a = 2; a < 4; a++) if (v[s * 4 + a] < 1.0f || v[s * 4 + a] > 8.0f) { fprintf(stderr, "[totk-input] %s: scale out of range\n", path); return; }
+    }
+    calibration.left  = (RuntimeStickCalibration){v[0], v[1], v[2], v[3]};
+    calibration.right = (RuntimeStickCalibration){v[4], v[5], v[6], v[7]};
+    fprintf(stderr, "[totk-input] stick calibration: %s\n", path);
+}
+static void save_calibration(void) {
+    char word[512];
+    snprintf(word, sizeof word, "%.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f\n",
+             calibration.left.centerX, calibration.left.centerY, calibration.left.scaleX, calibration.left.scaleY,
+             calibration.right.centerX, calibration.right.centerY, calibration.right.scaleX, calibration.right.scaleY);
+    setting_write("controller-calibration.txt", word, "stick calibration");
+}
+void runtime_gamepad_calibration_get(RuntimeGamepadCalibration *out) { *out = calibration; }
+void runtime_gamepad_calibration_set(const RuntimeGamepadCalibration *in) {
+    calibration = *in;
+    save_calibration();
+    hid_calibration_changed();
+    refresh_gamepads();
+    fprintf(stderr, "[totk-input] stick calibration: changed in the settings panel\n");
+}
+void runtime_gamepad_calibration_reset(void) {
+    calibration = (RuntimeGamepadCalibration){ .left = {0, 0, 1, 1}, .right = {0, 0, 1, 1} };
+    char path[4096];
+    if (setting_path("controller-calibration.txt", path, sizeof path)) unlink(path);
+    hid_calibration_changed();
+    refresh_gamepads();
+    fprintf(stderr, "[totk-input] stick calibration: default (reset)\n");
+}
+/* Separate files keep changes to one stick independent of the other's saved value.
+   The old single-value file remains a fallback for installations being upgraded. */
+static const char *stick_deadzone_file(int right) {
+    return right ? "controller-deadzone-right.txt" : "controller-deadzone-left.txt";
+}
+float runtime_gamepad_stick_deadzone_get(int right) { return stickDeadzone[right != 0]; }
+void runtime_gamepad_stick_deadzone_set(int right, float value) {
+    if (!isfinite(value)) return;
+    right = right != 0;
+    stickDeadzone[right] = fmaxf(0.0f, fminf(0.5f, value));
+    char word[32]; snprintf(word, sizeof word, "%.3f", stickDeadzone[right]);
+    setting_write(stick_deadzone_file(right), word, "radial stick deadzone");
+    hid_calibration_changed();
+    refresh_gamepads();
+}
+/* Compatibility for older callers: get the left value; a shared setter sets both. */
+float runtime_gamepad_deadzone_get(void) { return runtime_gamepad_stick_deadzone_get(0); }
+void runtime_gamepad_deadzone_set(float value) {
+    runtime_gamepad_stick_deadzone_set(0, value);
+    runtime_gamepad_stick_deadzone_set(1, value);
+}
+void runtime_gamepad_stick_preview(int right, float x, float y, float *outX, float *outY) {
+    int base = right ? STICK_RX : STICK_LX;
+    *outX = stick_component(base, x, y) / 32767.0f;
+    *outY = stick_component(base + 1, x, y) / 32767.0f;
+}
+static int read_stick_deadzone(const char *name, float *out) {
+    char path[4096], word[64], extra; float value;
+    if (!setting_read(name, word, sizeof word, path, sizeof path) ||
+        sscanf(word, "%f %c", &value, &extra) != 1 || !isfinite(value) || value < 0 || value > 0.5f)
+        return 0;
+    *out = value;
+    return 1;
+}
+static void load_stick_deadzone(void) {
+    float legacy = 0.12f;
+    read_stick_deadzone("controller-deadzone.txt", &legacy);
+    for (int right = 0; right < 2; right++) {
+        stickDeadzone[right] = legacy;
+        read_stick_deadzone(stick_deadzone_file(right), &stickDeadzone[right]);
+    }
+}
+void runtime_gamepad_stick_raw(float *lx, float *ly, float *rx, float *ry, int *connected) {
+    if (lx) *lx = gamepadRawLx; if (ly) *ly = gamepadRawLy;
+    if (rx) *rx = gamepadRawRx; if (ry) *ry = gamepadRawRy;
+    /* Presence is device topology, not an input cache: clearing held keys or losing
+       focus must not make a stationary, already registered controller disappear. */
+    if (connected) { int detected = -1; runtime_gamepad_type(&detected); *connected = detected >= 0; }
+}
+void runtime_gamepad_trigger_raw(float *lt, float *rt) {
+    if (lt) *lt = gamepadRawLT; if (rt) *rt = gamepadRawRT;
+}
+
 static int face_by_position(GCController *controller) {
     return gamepad_type_face_by_position(atomic_load(&controllerType), controller.productCategory.UTF8String, controller.vendorName.UTF8String);
 }
@@ -416,10 +535,11 @@ static void hid_pad_compute(void) {
     }
     hidPad.present = 1;
     hidPad.buttons = buttons;
-    hidPad.lx = stick_axis(lx);
-    hidPad.ly = stick_axis(-ly);    /* HID Y grows downwards, the game's grows upwards */
-    hidPad.rx = stick_axis(rx);
-    hidPad.ry = stick_axis(-ry);
+    hidPad.lx = stick_component(STICK_LX, lx, -ly);
+    hidPad.ly = stick_component(STICK_LY, lx, -ly);    /* HID Y grows downwards, the game's grows upwards */
+    hidPad.rx = stick_component(STICK_RX, rx, -ry);
+    hidPad.ry = stick_component(STICK_RY, rx, -ry);
+    hidRawLx = lx; hidRawLy = -ly; hidRawRx = rx; hidRawRy = -ry;   /* the raw sticks for the calibration tool */
 }
 
 static void hid_value(void *context, IOReturn result, void *sender, IOHIDValueRef value) {
@@ -461,6 +581,7 @@ static void hid_pad_reset(void) {
     memset(hidReach, 0, sizeof hidReach);
     memset(hidReachLogged, 0, sizeof hidReachLogged);
     hidPad = (HIDPadState){0};
+    hidRawLx = hidRawLy = hidRawRx = hidRawRy = 0;
 }
 
 /* 1: the pad's right stick is Rx/Ry (it has both and neither Z nor Rz). */
@@ -586,6 +707,15 @@ typedef struct { int present; uint64_t buttons; int32_t lx, ly, rx, ry; } HIDPad
 static HIDPadState hidPad;
 static void hid_pad_start(void) {}
 #endif
+
+/* A settings edit must update cached HID axes even without another input event. */
+static void hid_calibration_changed(void) {
+    if (!hidPad.present) return;
+    hidPad.lx = stick_component(STICK_LX, hidRawLx, hidRawLy);
+    hidPad.ly = stick_component(STICK_LY, hidRawLx, hidRawLy);
+    hidPad.rx = stick_component(STICK_RX, hidRawRx, hidRawRy);
+    hidPad.ry = stick_component(STICK_RY, hidRawRx, hidRawRy);
+}
 
 /* ---- Mouse mode (Mac, the settings panel; in mouse.txt) ----
    The window (runtime/frontend.m) holds the pointer while mouse mode is on and the window has the keyboard, and sends
@@ -840,6 +970,19 @@ static void awake_note_input(void) {   /* any thread */
 }
 #endif
 
+#if TARGET_OS_OSX
+/* Preserve the upstream DSU input response; this change calibrates native/HID sticks. */
+static int32_t stick_axis(float value) {
+    const float deadzone = 0.12f;
+    float magnitude = fabsf(value);
+    if (magnitude <= deadzone) return 0;
+    if (magnitude > 1.0f) magnitude = 1.0f;
+    int32_t result = (int32_t)((magnitude - deadzone) / (1.0f - deadzone) * 32767.0f);
+    return value < 0 ? -result : result;
+}
+
+#endif
+
 static void refresh_gamepads(void) {
 #if TARGET_OS_OSX
     /* The raw HID fallback must obey the same focus policy as GameController. Do not latch background presses. */
@@ -848,6 +991,8 @@ static void refresh_gamepads(void) {
     RuntimeGamepadState next = {0};
     uint64_t physical = (uint64_t)mouseButtons << CONTROLLER_MOUSE_FIRST;
     int32_t nativeLx = 0, nativeLy = 0, nativeRx = 0, nativeRy = 0;
+    float rawLx = 0, rawLy = 0, rawRx = 0, rawRy = 0;   /* the raw sticks (game coordinates), strongest controller wins */
+    float rawLT = 0, rawRT = 0;   /* the analog triggers, strongest controller wins */
     uint64_t rawAt = 0, rawRightAt = 0;
     int capture = captureDown;
     /* Keep activity per controller: a second pad's resting stick must not
@@ -881,8 +1026,8 @@ static void refresh_gamepads(void) {
         physical |= gamepad_buttons(pad, face_by_position(controller));
         if (!capture && pad.buttons[GCInputButtonShare].isPressed) capture = 1;   /* the capture button (see runtime_capture_set_hook) */
         float lx = pad.leftThumbstick.xAxis.value, ly = pad.leftThumbstick.yAxis.value;
-        nativeLx = stronger_axis(nativeLx, stick_axis(lx));
-        nativeLy = stronger_axis(nativeLy, stick_axis(ly));
+        nativeLx = stronger_axis(nativeLx, stick_component(STICK_LX, lx, ly));
+        nativeLy = stronger_axis(nativeLy, stick_component(STICK_LY, lx, ly));
         int wasActive = rawLeft.active;
         float rawX, rawY;
         if (controller == rawLeftController && switch_left_get(&rawLeft, lx, ly, runtime_now_ns(), &rawX, &rawY)) {
@@ -890,11 +1035,11 @@ static void refresh_gamepads(void) {
             rawAt = rawLeft.at;
             if (!wasActive) fprintf(stderr, "[totk-input] Switch left stick: native axes stuck at zero; using live HID input\n");
         }
-        next.lx = stronger_axis(next.lx, stick_axis(lx));
-        next.ly = stronger_axis(next.ly, stick_axis(ly));
+        next.lx = stronger_axis(next.lx, stick_component(STICK_LX, lx, ly));
+        next.ly = stronger_axis(next.ly, stick_component(STICK_LY, lx, ly));
         float rx = pad.rightThumbstick.xAxis.value, ry = pad.rightThumbstick.yAxis.value;
-        nativeRx = stronger_axis(nativeRx, stick_axis(rx));
-        nativeRy = stronger_axis(nativeRy, stick_axis(ry));
+        nativeRx = stronger_axis(nativeRx, stick_component(STICK_RX, rx, ry));
+        nativeRy = stronger_axis(nativeRy, stick_component(STICK_RY, rx, ry));
         int rightWasActive = rawRight.active;
         float rawRX, rawRY;
         if (controller == rawRightController && switch_left_get(&rawRight, rx, ry, runtime_now_ns(), &rawRX, &rawRY)) {
@@ -902,8 +1047,14 @@ static void refresh_gamepads(void) {
             rawRightAt = rawRight.at;
             if (!rightWasActive) fprintf(stderr, "[totk-input] Switch right stick: native axes stuck at zero; using live HID input\n");
         }
-        next.rx = stronger_axis(next.rx, stick_axis(rx));
-        next.ry = stronger_axis(next.ry, stick_axis(ry));
+        next.rx = stronger_axis(next.rx, stick_component(STICK_RX, rx, ry));
+        next.ry = stronger_axis(next.ry, stick_component(STICK_RY, rx, ry));
+        if (fabsf(lx) > fabsf(rawLx)) rawLx = lx;
+        if (fabsf(ly) > fabsf(rawLy)) rawLy = ly;
+        if (fabsf(rx) > fabsf(rawRx)) rawRx = rx;
+        if (fabsf(ry) > fabsf(rawRy)) rawRy = ry;
+        if (pad.leftTrigger.value > rawLT) rawLT = pad.leftTrigger.value;
+        if (pad.rightTrigger.value > rawRT) rawRT = pad.rightTrigger.value;
     }
     if (hidPad.present) {
         static PromptActivity previous;
@@ -918,7 +1069,15 @@ static void refresh_gamepads(void) {
         next.ly = stronger_axis(next.ly, hidPad.ly);
         next.rx = stronger_axis(next.rx, hidPad.rx);
         next.ry = stronger_axis(next.ry, hidPad.ry);
+        if (fabsf(hidRawLx) > fabsf(rawLx)) rawLx = hidRawLx;
+        if (fabsf(hidRawLy) > fabsf(rawLy)) rawLy = hidRawLy;
+        if (fabsf(hidRawRx) > fabsf(rawRx)) rawRx = hidRawRx;
+        if (fabsf(hidRawRy) > fabsf(rawRy)) rawRy = hidRawRy;
+        if (hidPad.buttons & (1ULL << 8)) rawLT = 1.0f;   /* the HID fallback's triggers are buttons */
+        if (hidPad.buttons & (1ULL << 9)) rawRT = 1.0f;
     }
+    stick_response_limit(&next.lx, &next.ly);
+    stick_response_limit(&next.rx, &next.ry);
 #if TARGET_OS_OSX
     if (dsuInput.connected && dsuAt && runtime_now_ns() - dsuAt < 500000000ull) {
         next.connected = 1; physical |= dsuInput.buttons;
@@ -998,6 +1157,8 @@ static void refresh_gamepads(void) {
     gamepadState = next;
     gamepadRawLeftAt = rawAt; gamepadRawRightAt = rawRightAt;
     gamepadNativeLx = nativeLx; gamepadNativeLy = nativeLy; gamepadNativeRx = nativeRx; gamepadNativeRy = nativeRy;
+    gamepadRawLx = rawLx; gamepadRawLy = rawLy; gamepadRawRx = rawRx; gamepadRawRy = rawRy;
+    gamepadRawLT = rawLT; gamepadRawRT = rawRT;
     pthread_mutex_unlock(&gamepadLock);
     if (shotWait != UINT64_MAX)
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(shotWait + 20 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{ refresh_gamepads(); });
@@ -1158,6 +1319,8 @@ void runtime_gamepad_start(void) {
     started = YES;
     load_controller_map();
     load_controller_type();
+    load_calibration();
+    load_stick_deadzone();
     load_settings_button();
     load_screenshot_button();
     load_mouse_mode();
@@ -1199,6 +1362,8 @@ void runtime_gamepad_clear(void) {
     gamepadState = (RuntimeGamepadState){0};
     gamepadRawLeftAt = 0; gamepadRawRightAt = 0;
     gamepadNativeLx = gamepadNativeLy = 0;
+    gamepadRawLx = gamepadRawLy = gamepadRawRx = gamepadRawRy = 0;
+    gamepadRawLT = gamepadRawRT = 0;
     pressedEdges = 0; textEdges = 0; textPad = (RuntimeGamepadState){0};
     settingsShortcutDown = settingsShortcutPending = 0;
     captureDown = captureSeen = 0;   /* a button held at focus loss must not shoot on the way back */
