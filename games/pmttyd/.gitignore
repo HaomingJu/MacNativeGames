@@ -1,0 +1,19 @@
+# Never commit game content, extracted ExeFS/RomFS, keys, shaders, saves, or generated binaries.
+exefs/
+romfs/
+extracted/
+rewritten/
+*.nsp
+*.xci
+*.nca
+*.nso
+prod.keys
+title.keys
+extraction-manifest.json
+
+__pycache__/
+build/
+venv/
+*.metallib
+*.ipa
+*.app/
